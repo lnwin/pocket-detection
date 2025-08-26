@@ -11,7 +11,40 @@
 #include <sstream>
 #include <vector>
 #include <cmath>
+struct RGBu8 { unsigned char r,g,b; };
 
+// 简单 HSV→RGB（h∈[0,1), s,v∈[0,1]）
+static RGBu8 hsv2rgb(float h, float s, float v){
+    h = h - std::floor(h);
+    float i = std::floor(h*6.0f);
+    float f = h*6.0f - i;
+    float p = v*(1.0f - s);
+    float q = v*(1.0f - f*s);
+    float t = v*(1.0f - (1.0f - f)*s);
+    float r,g,b;
+    switch ((int)i % 6) {
+    case 0: r=v; g=t; b=p; break;
+    case 1: r=q; g=v; b=p; break;
+    case 2: r=p; g=v; b=t; break;
+    case 3: r=p; g=q; b=v; break;
+    case 4: r=t; g=p; b=v; break;
+    case 5: r=v; g=p; b=q; break;
+    default: r=g=b=1.0f; break;
+    }
+    return RGBu8{ (unsigned char)std::round(r*255.0f),
+                 (unsigned char)std::round(g*255.0f),
+                 (unsigned char)std::round(b*255.0f) };
+}
+
+// 基于 pit_id 的取色：黄金角均匀分布不同色相
+static RGBu8 colorForPitId(int pit_id){
+    if (pit_id<=0) return RGBu8{255,255,255}; // 备用
+    // 黄金角 ~ 0.618...，不同 pit 均匀避开
+    float hue = std::fmod(0.61803398875f * (pit_id-1), 1.0f);
+    float sat = 0.70f;  // 适中饱和
+    float val = 0.95f;  // 明亮
+    return hsv2rgb(hue, sat, val);
+}
 struct Pt4 { float x,y,z,i; };
 struct PlaneFit {
     Eigen::Vector3f n = {0,0,1}; // unit normal
@@ -123,6 +156,127 @@ void addHullPolylineAlignedToWorld(const std::vector<Eigen::Vector2f>& hull_xy,
         for(int k=0;k<=num;++k){ float tt=float(k)/float(num); Eigen::Vector2f xy=A+tt*AB; Eigen::Vector3f q_align(xy.x(), xy.y(), 0.0f); Eigen::Vector3f p_world = Rt * (q_align - t);
             pts_out.push_back(Pt4{p_world.x(), p_world.y(), p_world.z(), 0.0f}); label_out.push_back(hull_label); }
     }
+}
+// ========== 写出 xyzrgb ==========
+bool writeTXT_xyzrgb(const std::string& path,
+                     const std::vector<Pt4>& pts,
+                     const std::vector<RGBu8>& colors)
+{
+    if (pts.size()!=colors.size()) return false;
+    std::ofstream ofs(path, std::ios::binary); if(!ofs.is_open()) return false;
+    ofs.setf(std::ios::fixed); ofs.precision(4);
+    for(size_t i=0;i<pts.size();++i){
+        ofs<<pts[i].x<<" "<<pts[i].y<<" "<<pts[i].z<<" "
+            <<(int)colors[i].r<<" "<<(int)colors[i].g<<" "<<(int)colors[i].b<<"\r\n";
+    }
+    ofs.flush(); return true;
+}
+// ========== 2D 连通域 + 椭圆拟合 + 凹槽编号 ==========
+struct EllipseInfo {
+    int   id;
+    cv::Point2f center;
+    cv::Size2f  axes;
+    float angle;     // degree
+    int   area_px;
+    int   num_pts;
+};
+
+// 输入：对齐坐标 Palign、已保留点的原索引 keep_idx、对应标签 label_keep
+// 输出：pit_id_keep（与 keep_idx 同长，非凹槽=0）；返回每个凹槽的椭圆信息
+std::vector<EllipseInfo>
+labelPitsAndFitEllipses(const std::vector<Eigen::Vector3f>& Palign,
+                        const std::vector<size_t>& keep_idx,
+                        const std::vector<char>& label_keep,
+                        float pixel_mm,          // 栅格分辨率（建议 0.5*thr）
+                        float min_area_mm2,      // 最小凹槽面积过滤
+                        std::vector<int>& pit_id_keep_out)
+{
+    pit_id_keep_out.assign(keep_idx.size(), 0);
+
+    // 收集凹槽点
+    std::vector<int> pit_pos; pit_pos.reserve(keep_idx.size());
+    float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f;
+    for(size_t i=0;i<keep_idx.size();++i){
+        if(label_keep[i]!=0) continue; // 只要凹槽
+        pit_pos.push_back((int)i);
+        const auto& q = Palign[ keep_idx[i] ];
+        xmin = std::min(xmin, q.x()); xmax = std::max(xmax, q.x());
+        ymin = std::min(ymin, q.y()); ymax = std::max(ymax, q.y());
+    }
+    if(pit_pos.empty()) return {};
+
+    // 建图（加边距）
+    float pad = 4.0f*pixel_mm;
+    xmin-=pad; xmax+=pad; ymin-=pad; ymax+=pad;
+    int W = std::max(1, (int)std::ceil((xmax-xmin)/pixel_mm));
+    int H = std::max(1, (int)std::ceil((ymax-ymin)/pixel_mm));
+    cv::Mat mask(H, W, CV_8U, cv::Scalar(0));
+
+    for(int gi : pit_pos){
+        const auto& q = Palign[ keep_idx[gi] ];
+        int x = (int)std::round((q.x()-xmin)/pixel_mm);
+        int y = (int)std::round((q.y()-ymin)/pixel_mm);
+        if(x>=0&&y>=0&&x<W&&y<H) mask.at<uint8_t>(y,x)=255;
+    }
+
+    // 连通域
+    cv::Mat labels, stats, cents;
+    int ncc = cv::connectedComponentsWithStats(mask, labels, stats, cents, 8, CV_32S);
+
+    // 每个组件收集像素点用于 fitEllipse
+    std::vector<std::vector<cv::Point2f>> pts_cc(ncc);
+    for(int gi : pit_pos){
+        const auto& q = Palign[ keep_idx[gi] ];
+        int x = (int)std::round((q.x()-xmin)/pixel_mm);
+        int y = (int)std::round((q.y()-ymin)/pixel_mm);
+        if(x>=0&&y>=0&&x<W&&y<H){
+            int lbl = labels.at<int>(y,x);
+            if(lbl>0) pts_cc[lbl].emplace_back((float)x,(float)y);
+        }
+    }
+
+    int next_id = 1;
+    std::vector<int> lbl_to_id(ncc, 0);
+    std::vector<EllipseInfo> infos;
+    infos.reserve(ncc);
+
+    int min_area_px = (int)std::ceil( min_area_mm2 / (pixel_mm*pixel_mm) );
+
+    for(int lbl=1; lbl<ncc; ++lbl){
+        int area_px = stats.at<int>(lbl, cv::CC_STAT_AREA);
+        if(area_px < min_area_px) continue;
+        if((int)pts_cc[lbl].size() < 5) continue; // fitEllipse 至少5点
+
+        cv::RotatedRect rr = cv::fitEllipse(pts_cc[lbl]);
+
+        EllipseInfo e;
+        e.id      = next_id;
+        e.center  = cv::Point2f(xmin + rr.center.x * pixel_mm,
+                               ymin + rr.center.y * pixel_mm);
+        e.axes    = cv::Size2f(rr.size.width * pixel_mm,
+                            rr.size.height * pixel_mm);
+        e.angle   = rr.angle;
+        e.area_px = area_px;
+        e.num_pts = (int)pts_cc[lbl].size();
+
+        infos.push_back(e);
+        lbl_to_id[lbl] = next_id;
+        ++next_id;
+    }
+
+    // 回填 pit_id
+    for(size_t i=0;i<keep_idx.size();++i){
+        if(label_keep[i]!=0) continue;
+        const auto& q = Palign[ keep_idx[i] ];
+        int x = (int)std::round((q.x()-xmin)/pixel_mm);
+        int y = (int)std::round((q.y()-ymin)/pixel_mm);
+        if(x>=0&&y>=0&&x<W&&y<H){
+            int lbl = labels.at<int>(y,x);
+            if(lbl>0){ int pid = lbl_to_id[lbl]; if(pid>0) pit_id_keep_out[i]=pid; }
+        }
+    }
+
+    return infos;
 }
 
 
@@ -249,35 +403,74 @@ int main(int argc, char *argv[])
 #endif
 
 
-    // === 分类与裁剪 ===
-    std::vector<Pt4> pts_keep; pts_keep.reserve(pts.size());
-    std::vector<char> label_keep; label_keep.reserve(pts.size());
 
+    // === 分类与裁剪 ===
+    std::vector<Pt4>  pts_keep;  pts_keep.reserve(pts.size());
+    std::vector<char> label_keep; label_keep.reserve(pts.size());
+    std::vector<size_t> keep_idx; keep_idx.reserve(pts.size()); // 记录原索引
 
     for(size_t i=0;i<pts.size();++i){
         const auto& q = Palign[i];
         Eigen::Vector2f xy(q.x(), q.y());
-#if USE_OPENCV_MASK
-        if(!xy_in_mask(mask, xy.x(), xy.y())) continue; // 掩膜外 → 丢弃
-#else
-        if(!pointInConvex(hull, xy)) continue; // 凸包外 → 丢弃
-#endif
+        if(!pointInConvex(hull, xy)) continue; // 或你的掩膜判断
+
         float z = q.z(); float ad = std::abs(z);
-        if (z > tau_up) continue; // 上方杂点 → 丢弃
-        if (z < -tau_down) continue; // 极深离群 → 丢弃
-        if (ad <= thr) { pts_keep.push_back(pts[i]); label_keep.push_back(1); } // 平面(绿)
-        else { pts_keep.push_back(pts[i]); label_keep.push_back(0); } // 凹槽(下方)
+        if (z > tau_up)   continue;
+        if (z < -tau_down) continue;
+
+        // 保留
+        pts_keep.push_back(pts[i]);
+        keep_idx.push_back(i);
+
+        if (ad <= thr) label_keep.push_back(1);   // 平面
+        else           label_keep.push_back(0);   // 凹槽
     }
 
-
     // === 画凸包折线（标签=2），写回到世界坐标 ===
+    // === 2D 连通域 + 椭圆拟合 + 凹槽编号 ===
+    float pixel_mm_pit = std::max(0.25f, 0.5f*thr);
+    float min_area_mm2 = 20.0f; // 过滤太小凹槽（按需要调）
+
+    std::vector<int> pit_id_keep; // 与 pts_keep/label_keep 对齐
+    auto ellipses = labelPitsAndFitEllipses(Palign, keep_idx, label_keep,
+                                            pixel_mm_pit, min_area_mm2,
+                                            pit_id_keep);
+
+    std::cerr<<"Pits found: "<<ellipses.size()<<"\n";
+    for(const auto& e: ellipses){
+        std::cerr<<"  pit#"<<e.id<<": center=("<<e.center.x<<","<<e.center.y<<") mm, "
+                  <<"axes=("<<e.axes.width<<","<<e.axes.height<<") mm, angle="<<e.angle
+                  <<", pts="<<e.num_pts<<", area_px="<<e.area_px<<"\n";
+    }
+
+    // === 画凸包折线（标签=2） ===
     float line_step_mm = std::max(0.5f, std::min(2.0f, thr));
     addHullPolylineAlignedToWorld(hull, line_step_mm, R, t, pts_keep, label_keep, 2);
+    // 为新追加的“线条点”补齐 pit_id=0
+    pit_id_keep.resize(label_keep.size(), 0);
 
+    // === 生成每点RGB：平面=绿，线=蓝，凹槽按 pit_id 彩色 ===
+    std::vector<RGBu8> colors; colors.reserve(label_keep.size());
+    for (size_t i=0;i<label_keep.size();++i){
+        char L = label_keep[i];
+        RGBu8 c;
+        if (L==1){            // 平面
+            c = RGBu8{  80, 220, 100};
+        } else if (L==2){     // 凸包线
+            c = RGBu8{  60, 120, 255};
+        } else {              // 凹槽
+            int pid = (i < pit_id_keep.size() ? pit_id_keep[i] : 0);
+            c = (pid>0) ? colorForPitId(pid) : RGBu8{255,180, 60};
+        }
+        colors.push_back(c);
+    }
 
-    // === 导出 ===
-    if(!writeTXT_labels(out_path, pts_keep, label_keep)){ std::cerr<<"Fail to write "<<out_path<<"\n"; return 1; }
+    // === 导出 xyzrgb ===
+    if(!writeTXT_xyzrgb(out_path, pts_keep, colors)){
+        std::cerr<<"Fail to write "<<out_path<<"\n"; return 1;
+    }
     std::cerr<<"Done: "<<out_path<<" (kept "<<pts_keep.size()<<" / "<<pts.size()<<" points)\n";
+
     return a.exec();
 
 }
