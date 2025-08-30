@@ -179,6 +179,8 @@ struct EllipseInfo {
     float angle;     // degree
     int   area_px;
     int   num_pts;
+    float ridus;
+    float distance_to_plane; // 新增字段，保存凹槽中心到平面的距离
 };
 
 // 输入：对齐坐标 Palign、已保留点的原索引 keep_idx、对应标签 label_keep
@@ -259,6 +261,11 @@ labelPitsAndFitEllipses(const std::vector<Eigen::Vector3f>& Palign,
         e.area_px = area_px;
         e.num_pts = (int)pts_cc[lbl].size();
 
+        // 将像素面积转换为毫米面积
+        float area_mm2 = area_px * pixel_mm * pixel_mm;
+      //  std::cerr << "Pit #" << next_id << " area: " << area_mm2 << " mm^2" <<" radius: " << 2 * std::sqrt(area_mm2/3.1415926) <<"mm\n";
+        e.ridus=2 * std::sqrt(area_mm2/3.1415926);
+
         infos.push_back(e);
         lbl_to_id[lbl] = next_id;
         ++next_id;
@@ -285,8 +292,8 @@ int main(int argc, char *argv[])
     QCoreApplication a(argc, argv);
 
 
-    std::string in_path = "C:/Users/40582/Desktop/2025_08_13_16_14_15.txt";
-    std::string out_path ="C:/Users/40582/Desktop/outPut.txt";
+    std::string in_path = "C:/Users/Administrator.DESKTOP-04T6SA5/Desktop/2025_08_13_16_14_15.txt";
+    std::string out_path ="C:/Users/Administrator.DESKTOP-04T6SA5/Desktop/OUTPUT.txt";
     // === 路径 & 参数（自行修改） ===
     float thr = 3.0f; // 判定在平面上的距离阈值（mm）——建议 0.6~1.2
     int iters = 2000; // RANSAC 迭代次数
@@ -429,7 +436,7 @@ int main(int argc, char *argv[])
     // === 画凸包折线（标签=2），写回到世界坐标 ===
     // === 2D 连通域 + 椭圆拟合 + 凹槽编号 ===
     float pixel_mm_pit = std::max(0.25f, 0.5f*thr);
-    float min_area_mm2 = 20.0f; // 过滤太小凹槽（按需要调）
+    float min_area_mm2 = 500.0f; // 过滤太小凹槽（按需要调）
 
     std::vector<int> pit_id_keep; // 与 pts_keep/label_keep 对齐
     auto ellipses = labelPitsAndFitEllipses(Palign, keep_idx, label_keep,
@@ -437,10 +444,19 @@ int main(int argc, char *argv[])
                                             pit_id_keep);
 
     std::cerr<<"Pits found: "<<ellipses.size()<<"\n";
-    for(const auto& e: ellipses){
-        std::cerr<<"  pit#"<<e.id<<": center=("<<e.center.x<<","<<e.center.y<<") mm, "
-                  <<"axes=("<<e.axes.width<<","<<e.axes.height<<") mm, angle="<<e.angle
-                  <<", pts="<<e.num_pts<<", area_px="<<e.area_px<<"\n";
+    // 为每个凹槽计算颜色并存储
+    std::vector<RGBu8> pit_colors;
+    pit_colors.reserve(ellipses.size());
+
+    for (const auto& e : ellipses) {
+        RGBu8 pit_color = colorForPitId(e.id);  // 为凹槽分配颜色
+        pit_colors.push_back(pit_color);         // 存储颜色
+
+        // 输出凹槽的详细信息，包括颜色
+        std::cerr << "  pit#" << e.id << ": center=(" << e.center.x << "," << e.center.y << ") mm, "
+                  << "axes=(" << e.axes.width << "," << e.axes.height << ") mm, angle=" << e.angle
+                  << ", pts=" << e.num_pts << ", radius:=" << e.ridus
+                  << ", color=(" << (int)pit_color.r << "," << (int)pit_color.g << "," << (int)pit_color.b << ")\n";
     }
 
     // === 画凸包折线（标签=2） ===
@@ -451,25 +467,31 @@ int main(int argc, char *argv[])
 
     // === 生成每点RGB：平面=绿，线=蓝，凹槽按 pit_id 彩色 ===
     std::vector<RGBu8> colors; colors.reserve(label_keep.size());
-    for (size_t i=0;i<label_keep.size();++i){
+    for (size_t i = 0; i < label_keep.size(); ++i) {
         char L = label_keep[i];
         RGBu8 c;
-        if (L==1){            // 平面
-            c = RGBu8{  80, 220, 100};
-        } else if (L==2){     // 凸包线
-            c = RGBu8{  60, 120, 255};
+        if (L == 1) {            // 平面
+            c = RGBu8{ 80, 220, 100 };
+        } else if (L == 2) {     // 凸包线
+            c = RGBu8{ 60, 120, 255 };
         } else {              // 凹槽
             int pid = (i < pit_id_keep.size() ? pit_id_keep[i] : 0);
-            c = (pid>0) ? colorForPitId(pid) : RGBu8{255,180, 60};
+            if (pid == 0) {
+                // 小面积凹槽与平面同色
+                c = RGBu8{ 80, 220, 100 }; // 平面颜色
+            } else {
+                c = (pid > 0) ? pit_colors[pid - 1] : RGBu8{ 255, 180, 60 };
+            }
         }
         colors.push_back(c);
     }
 
     // === 导出 xyzrgb ===
-    if(!writeTXT_xyzrgb(out_path, pts_keep, colors)){
-        std::cerr<<"Fail to write "<<out_path<<"\n"; return 1;
+    if (!writeTXT_xyzrgb(out_path, pts_keep, colors)) {
+        std::cerr << "Fail to write " << out_path << "\n";
+        return 1;
     }
-    std::cerr<<"Done: "<<out_path<<" (kept "<<pts_keep.size()<<" / "<<pts.size()<<" points)\n";
+    std::cerr << "Done: " << out_path << " (kept " << pts_keep.size() << " / " << pts.size() << " points)\n";
 
     return a.exec();
 
